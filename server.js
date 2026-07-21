@@ -3,6 +3,44 @@ const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 
+// ---------------------------------------------------------------------------
+// FIX: Twilio's WhatsApp webhook has no browser-style cookie jar. Each inbound
+// message is an independent HTTP request from Twilio's servers — a
+// `Set-Cookie` header on your response is never sent back to you on the next
+// message. The original code reset every session to "no session" on every
+// single message, which would have made real dispatches stall or loop.
+//
+// Fix: keep session state server-side, keyed by the sender's WhatsApp number
+// (req.body.From). In-memory Map works for a single-process demo; swap for
+// Redis or a DB table in production so a server restart mid-emergency
+// doesn't wipe active tickets.
+// ---------------------------------------------------------------------------
+
+const sessions = new Map(); // key: phone number (From), value: session object
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour, mirrors old Max-Age=3600
+
+function getSession(from) {
+  const entry = sessions.get(from);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > SESSION_TTL_MS) {
+    sessions.delete(from);
+    return null;
+  }
+  return entry.data;
+}
+
+function saveSession(from, data) {
+  sessions.set(from, { data, updatedAt: Date.now() });
+}
+
+// Optional: periodic sweep so memory doesn't grow unbounded over many days
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of sessions.entries()) {
+    if (now - entry.updatedAt > SESSION_TTL_MS) sessions.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
 // First Aid Instructions for Immediate Life Support
 const FIRST_AID_GUIDE = {
   '1': '🩸 *IMMEDIATE ACTION (BLEEDING/TRAUMA):*\n• Apply firm, direct pressure to the wound with a clean cloth.\n• Keep patient lying still. Do NOT move them if spinal injury is suspected.',
@@ -12,30 +50,15 @@ const FIRST_AID_GUIDE = {
   '5': '⚠️ *IMMEDIATE ACTION:*\n• Keep patient calm, comfortable, and warm until paramedics arrive.'
 };
 
-// Helper: Extract session data from Twilio HTTP Cookie
-function getSession(req) {
-  const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) return null;
-  const match = cookieHeader.match(/ambulink_session=([^;]+)/);
-  if (!match) return null;
-  try {
-    return JSON.parse(decodeURIComponent(match[1]));
-  } catch (e) {
-    return null;
-  }
-}
-
-// Helper: Save session state into Twilio HTTP Cookie header
-function setSessionCookie(res, sessionData) {
-  const jsonStr = encodeURIComponent(JSON.stringify(sessionData));
-  res.setHeader('Set-Cookie', `ambulink_session=${jsonStr}; Path=/; Max-Age=3600; HttpOnly`);
-}
-
 app.post('/twilio-webhook', (req, res) => {
   const from = req.body.From;
   const body = req.body.Body ? req.body.Body.trim() : '';
   const latitude = req.body.Latitude;
   const longitude = req.body.Longitude;
+
+  if (!from) {
+    return sendResponse(res, `We couldn't identify your number. Please try again.`);
+  }
 
   console.log(`📩 Message from ${from}: Body="${body}", Lat=${latitude}, Lon=${longitude}`);
 
@@ -48,7 +71,7 @@ app.post('/twilio-webhook', (req, res) => {
       ticketId: 'AMB-' + Math.floor(1000 + Math.random() * 9000)
     };
 
-    setSessionCookie(res, session);
+    saveSession(from, session);
 
     const reply = `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
       `Ticket *#${session.ticketId}* logged.\n` +
@@ -60,8 +83,8 @@ app.post('/twilio-webhook', (req, res) => {
     return sendResponse(res, reply);
   }
 
-  // Retrieve current active session from cookie
-  let session = getSession(req);
+  // Retrieve current active session from server-side store
+  let session = getSession(from);
 
   // 2. NO SESSION & NO LOCATION ➔ Prompt for GPS Location Pin
   if (!session) {
@@ -75,9 +98,9 @@ app.post('/twilio-webhook', (req, res) => {
   if (session.step === 'AWAITING_PATIENT_TYPE') {
     if (['1', '2'].includes(body) || body.toLowerCase().includes('myself') || body.toLowerCase().includes('someone')) {
       session.patient = (body === '1' || body.toLowerCase().includes('myself')) ? 'Self' : 'Bystander/Other';
-      session.step = 'AWAITING_CONDITION'; // Advance state
+      session.step = 'AWAITING_CONDITION';
 
-      setSessionCookie(res, session); // Save state update
+      saveSession(from, session);
 
       const reply = `Got it (Patient: *${session.patient}*).\n\n` +
         `What is the primary medical emergency?\n\n` +
@@ -107,12 +130,11 @@ app.post('/twilio-webhook', (req, res) => {
       session.condition = conditions[body];
       session.step = 'DISPATCHED';
 
-      setSessionCookie(res, session); // Save state update
+      saveSession(from, session);
 
       const navUrl = `https://www.google.com/maps/search/?api=1&query=${session.lat},${session.lon}`;
       const firstAidText = FIRST_AID_GUIDE[body];
 
-      // Console Output for Dispatcher Team
       console.log(`\n🚑 ==========================================`);
       console.log(`🚨 DISPATCH TICKET #${session.ticketId}`);
       console.log(`📞 Caller: ${from}`);
@@ -140,6 +162,9 @@ app.post('/twilio-webhook', (req, res) => {
       `Keep this line open. To request a *new* ambulance, please send a new GPS location pin.`;
     return sendResponse(res, reply);
   }
+
+  // Fallback: unknown step somehow reached
+  return sendResponse(res, `Something went wrong. Please send your location again to restart.`);
 });
 
 // Helper: Send Twilio TwiML XML Response
