@@ -1,16 +1,57 @@
 const express = require('express');
+const OpenAI = require('openai');
 const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+// ===========================================================================
+// CONFIGURATION (Paste your keys directly here - No .env file needed!)
+// ===========================================================================
+const OPENAI_API_KEY = 'YOUR_OPENAI_API_KEY_HERE'; // Replace with your sk-proj-... key
 const GOOGLE_SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID_HERE/exec';
+
+// Initialize OpenAI Client
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// ===========================================================================
+// AI FIRST AID HELPER
+// ===========================================================================
+async function getAIFirstAidAdvice(userQuery, condition = '') {
+  // Fallback if OpenAI key is not set
+  if (!OPENAI_API_KEY || OPENAI_API_KEY.includes('YOUR_OPENAI_API_KEY_HERE')) {
+    return "• Apply direct pressure if bleeding.\n• Keep patient calm, warm, and lying still until paramedics arrive.";
+  }
+
+  try {
+    const prompt = condition 
+      ? `Provide 3 short, bulleted emergency first-aid steps for: "${condition}". User notes: "${userQuery}".`
+      : `User question: "${userQuery}". Provide short, immediate first-aid or health advice.`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an emergency medical and first-aid AI assistant for Ambulink. 
+          - Provide practical, concise, bulleted first-aid steps.
+          - Keep answers brief and easy to read on a mobile screen during an emergency.
+          - Reassure the user and advise them to remain calm.`
+        },
+        { role: 'user', content: prompt }
+      ]
+    });
+
+    return completion.choices[0].message.content;
+  } catch (err) {
+    console.error('❌ AI First Aid Error:', err.message);
+    return "• Keep the patient calm, warm, and lying still until paramedics arrive.";
+  }
+}
 
 // Simulated OpenAI Whisper Transcription Helper
 async function transcribeAudio(audioUrl) {
   try {
-    // In production, fetch audioUrl and send to OpenAI Whisper API
-    // const transcript = await openai.audio.transcriptions.create({ file: audioStream, model: 'whisper-1' });
     console.log(`🎙️ Processing voice note from: ${audioUrl}`);
     return "[Voice Note Received - Play Audio in Dispatch Sheet]"; 
   } catch (err) {
@@ -36,6 +77,9 @@ async function syncToGoogleSheet(ticketData) {
 
 const sessions = new Map();
 
+// ===========================================================================
+// MAIN TWILIO WEBHOOK ROUTE
+// ===========================================================================
 app.post('/twilio-webhook', async (req, res) => {
   const from = req.body.From;
   const body = req.body.Body ? req.body.Body.trim() : '';
@@ -75,7 +119,16 @@ app.post('/twilio-webhook', async (req, res) => {
 
   let session = sessions.get(from);
 
+  // 2. NO SESSION & NO LOCATION ➔ Answer First Aid Question via AI or Request Location
   if (!session) {
+    if (body) {
+      const aiAdvice = await getAIFirstAidAdvice(body);
+      return sendResponse(res, 
+        `🩹 *AMBULINK FIRST AID ASSISTANT*\n\n` +
+        `${aiAdvice}\n\n` +
+        `🚨 *Need an ambulance?* Tap 📎 *Attachment* ➔ *Location* to send your GPS coordinates.`
+      );
+    }
     return sendResponse(res, `🚨 *AMBULINK EMERGENCY DISPATCH*\n\nPlease tap 📎 *Attachment* ➔ *Location* to send your GPS coordinates.`);
   }
 
@@ -88,23 +141,26 @@ app.post('/twilio-webhook', async (req, res) => {
     '5': 'Other Urgent Emergency'
   };
 
-  // 2. TICKET ALREADY DISPATCHED ➔ Handle Corrections, Audio, & Updates
+  // 3. TICKET ALREADY DISPATCHED ➔ Handle AI Questions, Corrections, & Voice Notes
   if (session.step === 'DISPATCHED') {
     
-    // A. Handle Condition Correction (e.g. sent '3' by mistake, now sends '4')
+    // A. Handle Condition Correction (e.g., sent '3' by mistake, now sends '4')
     if (conditions[body]) {
       const oldCondition = session.condition;
       session.condition = conditions[body];
       session.notes += ` | Corrected from [${oldCondition}] to [${session.condition}]`;
       
       sessions.set(from, session);
-      syncToGoogleSheet(session); // Pushes update to Google Sheet instantly
+      syncToGoogleSheet(session);
+
+      const aiFirstAid = await getAIFirstAidAdvice('', session.condition);
 
       return sendResponse(res, 
         `🔄 *TICKET UPDATED!*\n\n` +
         `Ticket: *#${session.ticketId}*\n` +
         `Updated Condition: *${session.condition}*\n\n` +
-        `Dispatch control room and paramedics have been notified of this correction.`
+        `🩺 *IMMEDIATE FIRST AID:*\n${aiFirstAid}\n\n` +
+        `Dispatch control room and paramedics have been notified.`
       );
     }
 
@@ -115,7 +171,7 @@ app.post('/twilio-webhook', async (req, res) => {
       session.notes += ` | Voice Note: ${transcript}`;
       
       sessions.set(from, session);
-      syncToGoogleSheet(session); // Pushes Audio URL + Transcript to Google Sheet
+      syncToGoogleSheet(session);
 
       return sendResponse(res, 
         `🎙️ *VOICE NOTE RECEIVED*\n\n` +
@@ -132,21 +188,22 @@ app.post('/twilio-webhook', async (req, res) => {
       return sendResponse(res, `🛑 Ticket *#${session.ticketId}* has been CANCELLED. Send a new location pin if you still need help.`);
     }
 
-    // D. General Text Message Update
+    // D. General Text Message ➔ Generate AI First Aid Advice & Save Note
     if (body) {
-      session.notes += ` | Note: ${body}`;
+      const aiFirstAid = await getAIFirstAidAdvice(body, session.condition);
+      session.notes += ` | User asked: "${body}"`;
       sessions.set(from, session);
       syncToGoogleSheet(session);
 
       return sendResponse(res, 
-        `📝 *NOTE ADDED TO TICKET #${session.ticketId}*\n\n` +
-        `"${body}"\n\n` +
-        `Paramedics en route. To correct medical condition, reply with 1-5. To cancel, reply *CANCEL*.`
+        `🩺 *FIRST AID ADVICE (Ticket #${session.ticketId})*\n\n` +
+        `${aiFirstAid}\n\n` +
+        `📍 *Paramedics are en route.* To update condition reply *1-5*, or reply *CANCEL*.`
       );
     }
   }
 
-  // 3. STEP 1: PATIENT TYPE
+  // 4. STEP 1: PATIENT TYPE
   if (session.step === 'AWAITING_PATIENT_TYPE') {
     if (['1', '2'].includes(body) || body.toLowerCase().includes('myself') || body.toLowerCase().includes('someone')) {
       session.patient = (body === '1' || body.toLowerCase().includes('myself')) ? 'Self' : 'Bystander/Other';
@@ -161,12 +218,12 @@ app.post('/twilio-webhook', async (req, res) => {
         `3️⃣ 🧠 Unconscious / Unresponsive\n` +
         `4️⃣ 🤰 Pregnancy / Labor\n` +
         `5️⃣ ⚠️ Other Urgent Emergency\n\n` +
-        `*(Or send a quick Voice Note describing the situation)*`
+        `*(Or type any first aid question)*`
       );
     }
   }
 
-  // 4. STEP 2: CONDITION & INITIAL DISPATCH
+  // 5. STEP 2: CONDITION & DISPATCH WITH AI FIRST AID
   if (session.step === 'AWAITING_CONDITION') {
     if (conditions[body] || isAudio) {
       if (isAudio) {
@@ -183,12 +240,16 @@ app.post('/twilio-webhook', async (req, res) => {
 
       syncToGoogleSheet(session);
 
+      // Generate instant AI First Aid Advice for selected condition
+      const aiAdvice = await getAIFirstAidAdvice(body, session.condition);
+
       return sendResponse(res, 
         `✅ *AMBULANCE DISPATCHED!*\n\n` +
         `Ticket: *#${session.ticketId}*\n` +
-        `Condition: *${session.condition}*\n\n` +
-        `📍 Paramedics en route to your location.\n\n` +
-        `💡 *Made a mistake?* Reply *1 to 5* to correct the condition, send a *Voice Note*, or reply *CANCEL*.`
+        `Condition: *${session.condition}*\n` +
+        `Status: Paramedics en route.\n\n` +
+        `🩺 *IMMEDIATE ACTION GUIDANCE:*\n${aiAdvice}\n\n` +
+        `💡 Reply with any medical question, reply *1-5* to correct condition, or reply *CANCEL*.`
       );
     }
   }
@@ -205,3 +266,6 @@ function sendResponse(res, textMessage) {
 }
 
 module.exports = app;
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Ambulink AI Core Engine running on port ${PORT}`));
