@@ -2,172 +2,200 @@ const express = require('express');
 const app = express();
 
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-// ---------------------------------------------------------------------------
-// FIX: Twilio's WhatsApp webhook has no browser-style cookie jar. Each inbound
-// message is an independent HTTP request from Twilio's servers — a
-// `Set-Cookie` header on your response is never sent back to you on the next
-// message. The original code reset every session to "no session" on every
-// single message, which would have made real dispatches stall or loop.
-//
-// Fix: keep session state server-side, keyed by the sender's WhatsApp number
-// (req.body.From). In-memory Map works for a single-process demo; swap for
-// Redis or a DB table in production so a server restart mid-emergency
-// doesn't wipe active tickets.
-// ---------------------------------------------------------------------------
+const GOOGLE_SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID_HERE/exec';
 
-const sessions = new Map(); // key: phone number (From), value: session object
-const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour, mirrors old Max-Age=3600
-
-function getSession(from) {
-  const entry = sessions.get(from);
-  if (!entry) return null;
-  if (Date.now() - entry.updatedAt > SESSION_TTL_MS) {
-    sessions.delete(from);
-    return null;
+// Simulated OpenAI Whisper Transcription Helper
+async function transcribeAudio(audioUrl) {
+  try {
+    // In production, fetch audioUrl and send to OpenAI Whisper API
+    // const transcript = await openai.audio.transcriptions.create({ file: audioStream, model: 'whisper-1' });
+    console.log(`🎙️ Processing voice note from: ${audioUrl}`);
+    return "[Voice Note Received - Play Audio in Dispatch Sheet]"; 
+  } catch (err) {
+    console.error("Audio Transcription Error:", err);
+    return "[Voice note attached]";
   }
-  return entry.data;
 }
 
-function saveSession(from, data) {
-  sessions.set(from, { data, updatedAt: Date.now() });
+// Sync updates to Google Sheets
+async function syncToGoogleSheet(ticketData) {
+  if (!GOOGLE_SHEET_WEBHOOK_URL || GOOGLE_SHEET_WEBHOOK_URL.includes('YOUR_APPS_SCRIPT_ID_HERE')) return;
+  try {
+    await fetch(GOOGLE_SHEET_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ticketData),
+      redirect: 'follow'
+    });
+  } catch (err) {
+    console.error('❌ Sync Error:', err.message);
+  }
 }
 
-// Optional: periodic sweep so memory doesn't grow unbounded over many days
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of sessions.entries()) {
-    if (now - entry.updatedAt > SESSION_TTL_MS) sessions.delete(key);
-  }
-}, 10 * 60 * 1000).unref();
+const sessions = new Map();
 
-// First Aid Instructions for Immediate Life Support
-const FIRST_AID_GUIDE = {
-  '1': '🩸 *IMMEDIATE ACTION (BLEEDING/TRAUMA):*\n• Apply firm, direct pressure to the wound with a clean cloth.\n• Keep patient lying still. Do NOT move them if spinal injury is suspected.',
-  '2': '🫁 *IMMEDIATE ACTION (BREATHING/CHEST PAIN):*\n• Sit patient upright in a comfortable position.\n• Loosen tight clothing around neck and chest.\n• Help them stay calm and take slow, deep breaths.',
-  '3': '🧠 *IMMEDIATE ACTION (UNRESPONSIVE):*\n• Place patient in Recovery Position (on their left side).\n• Ensure mouth and airway are clear of fluids/vomit.\n• Do NOT give water or food.',
-  '4': '🤰 *IMMEDIATE ACTION (PREGNANCY/LABOR):*\n• Keep mother lying on her left side to maximize blood flow.\n• Keep warm with blankets. Prepare clean towels.',
-  '5': '⚠️ *IMMEDIATE ACTION:*\n• Keep patient calm, comfortable, and warm until paramedics arrive.'
-};
-
-app.post('/twilio-webhook', (req, res) => {
+app.post('/twilio-webhook', async (req, res) => {
   const from = req.body.From;
   const body = req.body.Body ? req.body.Body.trim() : '';
   const latitude = req.body.Latitude;
   const longitude = req.body.Longitude;
+  
+  // Twilio Audio Parameters
+  const mediaUrl = req.body.MediaUrl0;
+  const mediaType = req.body.MediaContentType0;
+  const isAudio = mediaUrl && mediaType && mediaType.startsWith('audio/');
 
-  if (!from) {
-    return sendResponse(res, `We couldn't identify your number. Please try again.`);
-  }
+  if (!from) return sendResponse(res, `Couldn't identify sender.`);
 
-  console.log(`📩 Message from ${from}: Body="${body}", Lat=${latitude}, Lon=${longitude}`);
-
-  // 1. NEW LOCATION PIN RECEIVED ➔ Start New Session
+  // 1. NEW GPS LOCATION PIN ➔ Starts or Resets Ticket
   if (latitude && longitude) {
     const session = {
+      from,
       step: 'AWAITING_PATIENT_TYPE',
       lat: latitude,
       lon: longitude,
-      ticketId: 'AMB-' + Math.floor(1000 + Math.random() * 9000)
+      ticketId: 'AMB-' + Math.floor(1000 + Math.random() * 9000),
+      status: 'AWAITING_INFO',
+      audioUrl: '',
+      notes: ''
     };
 
-    saveSession(from, session);
+    sessions.set(from, session);
+    syncToGoogleSheet(session);
 
-    const reply = `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
+    return sendResponse(res, 
+      `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
       `Ticket *#${session.ticketId}* logged.\n` +
-      `Coordinates: ${latitude}, ${longitude}\n\n` +
       `Who needs emergency medical help?\n\n` +
-      `1️⃣ Myself\n` +
-      `2️⃣ Someone else`;
-
-    return sendResponse(res, reply);
+      `1️⃣ Myself\n2️⃣ Someone else`
+    );
   }
 
-  // Retrieve current active session from server-side store
-  let session = getSession(from);
+  let session = sessions.get(from);
 
-  // 2. NO SESSION & NO LOCATION ➔ Prompt for GPS Location Pin
   if (!session) {
-    const reply = `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
-      `We need your location to dispatch an ambulance!\n\n` +
-      `Tap 📎 *Attachment* ➔ *Location* ➔ *Send Current Location*.`;
-    return sendResponse(res, reply);
+    return sendResponse(res, `🚨 *AMBULINK EMERGENCY DISPATCH*\n\nPlease tap 📎 *Attachment* ➔ *Location* to send your GPS coordinates.`);
   }
 
-  // 3. STEP 1 ➔ STEP 2: Handle Patient Type (1 or 2)
+  // Define Medical Condition Mapping
+  const conditions = {
+    '1': 'Accident / Severe Bleeding',
+    '2': 'Breathing Difficulty / Chest Pain',
+    '3': 'Unconscious / Unresponsive',
+    '4': 'Pregnancy / Labor',
+    '5': 'Other Urgent Emergency'
+  };
+
+  // 2. TICKET ALREADY DISPATCHED ➔ Handle Corrections, Audio, & Updates
+  if (session.step === 'DISPATCHED') {
+    
+    // A. Handle Condition Correction (e.g. sent '3' by mistake, now sends '4')
+    if (conditions[body]) {
+      const oldCondition = session.condition;
+      session.condition = conditions[body];
+      session.notes += ` | Corrected from [${oldCondition}] to [${session.condition}]`;
+      
+      sessions.set(from, session);
+      syncToGoogleSheet(session); // Pushes update to Google Sheet instantly
+
+      return sendResponse(res, 
+        `🔄 *TICKET UPDATED!*\n\n` +
+        `Ticket: *#${session.ticketId}*\n` +
+        `Updated Condition: *${session.condition}*\n\n` +
+        `Dispatch control room and paramedics have been notified of this correction.`
+      );
+    }
+
+    // B. Handle Audio Voice Notes
+    if (isAudio) {
+      session.audioUrl = mediaUrl;
+      const transcript = await transcribeAudio(mediaUrl);
+      session.notes += ` | Voice Note: ${transcript}`;
+      
+      sessions.set(from, session);
+      syncToGoogleSheet(session); // Pushes Audio URL + Transcript to Google Sheet
+
+      return sendResponse(res, 
+        `🎙️ *VOICE NOTE RECEIVED*\n\n` +
+        `Audio recording attached to Ticket *#${session.ticketId}* and forwarded directly to the responding unit.`
+      );
+    }
+
+    // C. Handle Cancellation
+    if (body.toLowerCase() === 'cancel') {
+      session.status = 'CANCELLED';
+      syncToGoogleSheet(session);
+      sessions.delete(from);
+
+      return sendResponse(res, `🛑 Ticket *#${session.ticketId}* has been CANCELLED. Send a new location pin if you still need help.`);
+    }
+
+    // D. General Text Message Update
+    if (body) {
+      session.notes += ` | Note: ${body}`;
+      sessions.set(from, session);
+      syncToGoogleSheet(session);
+
+      return sendResponse(res, 
+        `📝 *NOTE ADDED TO TICKET #${session.ticketId}*\n\n` +
+        `"${body}"\n\n` +
+        `Paramedics en route. To correct medical condition, reply with 1-5. To cancel, reply *CANCEL*.`
+      );
+    }
+  }
+
+  // 3. STEP 1: PATIENT TYPE
   if (session.step === 'AWAITING_PATIENT_TYPE') {
     if (['1', '2'].includes(body) || body.toLowerCase().includes('myself') || body.toLowerCase().includes('someone')) {
       session.patient = (body === '1' || body.toLowerCase().includes('myself')) ? 'Self' : 'Bystander/Other';
       session.step = 'AWAITING_CONDITION';
+      sessions.set(from, session);
 
-      saveSession(from, session);
-
-      const reply = `Got it (Patient: *${session.patient}*).\n\n` +
+      return sendResponse(res, 
+        `Got it (Patient: *${session.patient}*).\n\n` +
         `What is the primary medical emergency?\n\n` +
         `1️⃣ 🩸 Accident / Severe Bleeding\n` +
         `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
         `3️⃣ 🧠 Unconscious / Unresponsive\n` +
         `4️⃣ 🤰 Pregnancy / Labor\n` +
-        `5️⃣ ⚠️ Other Urgent Emergency`;
-
-      return sendResponse(res, reply);
-    } else {
-      return sendResponse(res, `Please reply with *1* for Myself or *2* for Someone else.`);
+        `5️⃣ ⚠️ Other Urgent Emergency\n\n` +
+        `*(Or send a quick Voice Note describing the situation)*`
+      );
     }
   }
 
-  // 4. STEP 2 ➔ STEP 3: Handle Emergency Condition (1 - 5) & Dispatch
+  // 4. STEP 2: CONDITION & INITIAL DISPATCH
   if (session.step === 'AWAITING_CONDITION') {
-    if (['1', '2', '3', '4', '5'].includes(body)) {
-      const conditions = {
-        '1': 'Accident / Severe Bleeding',
-        '2': 'Breathing Difficulty / Chest Pain',
-        '3': 'Unconscious / Unresponsive',
-        '4': 'Pregnancy / Labor',
-        '5': 'Other Urgent Emergency'
-      };
+    if (conditions[body] || isAudio) {
+      if (isAudio) {
+        session.audioUrl = mediaUrl;
+        session.condition = "Voice Note Provided";
+        session.notes = await transcribeAudio(mediaUrl);
+      } else {
+        session.condition = conditions[body];
+      }
 
-      session.condition = conditions[body];
       session.step = 'DISPATCHED';
+      session.status = 'DISPATCHED';
+      sessions.set(from, session);
 
-      saveSession(from, session);
+      syncToGoogleSheet(session);
 
-      const navUrl = `https://www.google.com/maps/search/?api=1&query=${session.lat},${session.lon}`;
-      const firstAidText = FIRST_AID_GUIDE[body];
-
-      console.log(`\n🚑 ==========================================`);
-      console.log(`🚨 DISPATCH TICKET #${session.ticketId}`);
-      console.log(`📞 Caller: ${from}`);
-      console.log(`👤 Patient: ${session.patient}`);
-      console.log(`🩺 Medical Condition: ${session.condition}`);
-      console.log(`📍 Google Maps Navigation: ${navUrl}`);
-      console.log(`==========================================\n`);
-
-      const reply = `✅ *AMBULANCE DISPATCHED!*\n\n` +
+      return sendResponse(res, 
+        `✅ *AMBULANCE DISPATCHED!*\n\n` +
         `Ticket: *#${session.ticketId}*\n` +
-        `Condition: *${session.condition}*\n` +
-        `Status: Paramedics en route to your GPS location.\n\n` +
-        `${firstAidText}\n\n` +
-        `📞 *Need urgent human escalation?* Call our dispatch control line immediately if conditions worsen.`;
-
-      return sendResponse(res, reply);
-    } else {
-      return sendResponse(res, `Please reply with a number from *1 to 5* to indicate the medical emergency.`);
+        `Condition: *${session.condition}*\n\n` +
+        `📍 Paramedics en route to your location.\n\n` +
+        `💡 *Made a mistake?* Reply *1 to 5* to correct the condition, send a *Voice Note*, or reply *CANCEL*.`
+      );
     }
   }
 
-  // 5. POST-DISPATCH FOLLOW UP
-  if (session.step === 'DISPATCHED') {
-    const reply = `🚑 Ambulance unit for Ticket *#${session.ticketId}* is currently moving to your location.\n\n` +
-      `Keep this line open. To request a *new* ambulance, please send a new GPS location pin.`;
-    return sendResponse(res, reply);
-  }
-
-  // Fallback: unknown step somehow reached
-  return sendResponse(res, `Something went wrong. Please send your location again to restart.`);
+  return sendResponse(res, `Please reply with a valid option (1-5), send a Voice Note, or send a new GPS location.`);
 });
 
-// Helper: Send Twilio TwiML XML Response
 function sendResponse(res, textMessage) {
   res.type('text/xml').send(`
     <Response>
@@ -177,6 +205,3 @@ function sendResponse(res, textMessage) {
 }
 
 module.exports = app;
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Ambulink Core Engine running on port ${PORT}`));
