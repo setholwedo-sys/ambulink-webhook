@@ -3,9 +3,6 @@ const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 
-// In-memory session store (tracks user progress by phone number)
-const sessions = {};
-
 // First Aid Instructions for Immediate Life Support
 const FIRST_AID_GUIDE = {
   '1': '🩸 *IMMEDIATE ACTION (BLEEDING/TRAUMA):*\n• Apply firm, direct pressure to the wound with a clean cloth.\n• Keep patient lying still. Do NOT move them if spinal injury is suspected.',
@@ -15,6 +12,25 @@ const FIRST_AID_GUIDE = {
   '5': '⚠️ *IMMEDIATE ACTION:*\n• Keep patient calm, comfortable, and warm until paramedics arrive.'
 };
 
+// Helper: Extract session data from Twilio HTTP Cookie
+function getSession(req) {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+  const match = cookieHeader.match(/ambulink_session=([^;]+)/);
+  if (!match) return null;
+  try {
+    return JSON.parse(decodeURIComponent(match[1]));
+  } catch (e) {
+    return null;
+  }
+}
+
+// Helper: Save session state into Twilio HTTP Cookie header
+function setSessionCookie(res, sessionData) {
+  const jsonStr = encodeURIComponent(JSON.stringify(sessionData));
+  res.setHeader('Set-Cookie', `ambulink_session=${jsonStr}; Path=/; Max-Age=3600; HttpOnly`);
+}
+
 app.post('/twilio-webhook', (req, res) => {
   const from = req.body.From;
   const body = req.body.Body ? req.body.Body.trim() : '';
@@ -23,17 +39,19 @@ app.post('/twilio-webhook', (req, res) => {
 
   console.log(`📩 Message from ${from}: Body="${body}", Lat=${latitude}, Lon=${longitude}`);
 
-  // Initialize or reset session if new location is received
+  // 1. NEW LOCATION PIN RECEIVED ➔ Start New Session
   if (latitude && longitude) {
-    sessions[from] = {
+    const session = {
       step: 'AWAITING_PATIENT_TYPE',
       lat: latitude,
       lon: longitude,
       ticketId: 'AMB-' + Math.floor(1000 + Math.random() * 9000)
     };
 
+    setSessionCookie(res, session);
+
     const reply = `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
-      `Ticket *#${sessions[from].ticketId}* logged.\n` +
+      `Ticket *#${session.ticketId}* logged.\n` +
       `Coordinates: ${latitude}, ${longitude}\n\n` +
       `Who needs emergency medical help?\n\n` +
       `1️⃣ Myself\n` +
@@ -42,24 +60,26 @@ app.post('/twilio-webhook', (req, res) => {
     return sendResponse(res, reply);
   }
 
-  // Retrieve current active session
-  const userSession = sessions[from];
+  // Retrieve current active session from cookie
+  let session = getSession(req);
 
-  // FALLBACK: If user texts without sending location first
-  if (!userSession) {
+  // 2. NO SESSION & NO LOCATION ➔ Prompt for GPS Location Pin
+  if (!session) {
     const reply = `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
       `We need your location to dispatch an ambulance!\n\n` +
       `Tap 📎 *Attachment* ➔ *Location* ➔ *Send Current Location*.`;
     return sendResponse(res, reply);
   }
 
-  // STEP 1 ➔ STEP 2: Handle Patient Type (1 or 2)
-  if (userSession.step === 'AWAITING_PATIENT_TYPE') {
+  // 3. STEP 1 ➔ STEP 2: Handle Patient Type (1 or 2)
+  if (session.step === 'AWAITING_PATIENT_TYPE') {
     if (['1', '2'].includes(body) || body.toLowerCase().includes('myself') || body.toLowerCase().includes('someone')) {
-      userSession.patient = (body === '1' || body.toLowerCase().includes('myself')) ? 'Self' : 'Bystander/Other';
-      userSession.step = 'AWAITING_CONDITION'; // Advance state
+      session.patient = (body === '1' || body.toLowerCase().includes('myself')) ? 'Self' : 'Bystander/Other';
+      session.step = 'AWAITING_CONDITION'; // Advance state
 
-      const reply = `Got it (Patient: *${userSession.patient}*).\n\n` +
+      setSessionCookie(res, session); // Save state update
+
+      const reply = `Got it (Patient: *${session.patient}*).\n\n` +
         `What is the primary medical emergency?\n\n` +
         `1️⃣ 🩸 Accident / Severe Bleeding\n` +
         `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
@@ -73,8 +93,8 @@ app.post('/twilio-webhook', (req, res) => {
     }
   }
 
-  // STEP 2 ➔ STEP 3: Handle Emergency Condition (1 - 5) & Dispatch
-  if (userSession.step === 'AWAITING_CONDITION') {
+  // 4. STEP 2 ➔ STEP 3: Handle Emergency Condition (1 - 5) & Dispatch
+  if (session.step === 'AWAITING_CONDITION') {
     if (['1', '2', '3', '4', '5'].includes(body)) {
       const conditions = {
         '1': 'Accident / Severe Bleeding',
@@ -84,24 +104,26 @@ app.post('/twilio-webhook', (req, res) => {
         '5': 'Other Urgent Emergency'
       };
 
-      userSession.condition = conditions[body];
-      userSession.step = 'DISPATCHED';
+      session.condition = conditions[body];
+      session.step = 'DISPATCHED';
 
-      const navUrl = `https://www.google.com/maps/search/?api=1&query=${userSession.lat},${userSession.lon}`;
+      setSessionCookie(res, session); // Save state update
+
+      const navUrl = `https://www.google.com/maps/search/?api=1&query=${session.lat},${session.lon}`;
       const firstAidText = FIRST_AID_GUIDE[body];
 
-      // Dispatcher Console Output
+      // Console Output for Dispatcher Team
       console.log(`\n🚑 ==========================================`);
-      console.log(`🚨 DISPATCH TICKET #${userSession.ticketId}`);
+      console.log(`🚨 DISPATCH TICKET #${session.ticketId}`);
       console.log(`📞 Caller: ${from}`);
-      console.log(`👤 Patient: ${userSession.patient}`);
-      console.log(`🩺 Medical Condition: ${userSession.condition}`);
-      console.log(`📍 Google Maps Link: ${navUrl}`);
+      console.log(`👤 Patient: ${session.patient}`);
+      console.log(`🩺 Medical Condition: ${session.condition}`);
+      console.log(`📍 Google Maps Navigation: ${navUrl}`);
       console.log(`==========================================\n`);
 
       const reply = `✅ *AMBULANCE DISPATCHED!*\n\n` +
-        `Ticket: *#${userSession.ticketId}*\n` +
-        `Condition: *${userSession.condition}*\n` +
+        `Ticket: *#${session.ticketId}*\n` +
+        `Condition: *${session.condition}*\n` +
         `Status: Paramedics en route to your GPS location.\n\n` +
         `${firstAidText}\n\n` +
         `📞 *Need urgent human escalation?* Call our dispatch control line immediately if conditions worsen.`;
@@ -112,15 +134,15 @@ app.post('/twilio-webhook', (req, res) => {
     }
   }
 
-  // STEP 3 COMPLETE: Follow-up messages after dispatch
-  if (userSession.step === 'DISPATCHED') {
-    const reply = `🚑 Ambulance unit for Ticket *#${userSession.ticketId}* is currently moving to your location.\n\n` +
-      `Keep this line open. If you need to request a *new* ambulance, please send a new GPS location pin.`;
+  // 5. POST-DISPATCH FOLLOW UP
+  if (session.step === 'DISPATCHED') {
+    const reply = `🚑 Ambulance unit for Ticket *#${session.ticketId}* is currently moving to your location.\n\n` +
+      `Keep this line open. To request a *new* ambulance, please send a new GPS location pin.`;
     return sendResponse(res, reply);
   }
 });
 
-// Helper function to send Twilio TwiML response
+// Helper: Send Twilio TwiML XML Response
 function sendResponse(res, textMessage) {
   res.type('text/xml').send(`
     <Response>
