@@ -32,7 +32,19 @@ async function syncToGoogleSheet(ticketData) {
   }
 }
 
+// In-Memory Session Storage
 const sessions = new Map();
+
+// Automatic cleanup: Delete inactive sessions older than 6 hours
+setInterval(() => {
+  const now = Date.now();
+  const SIX_HOURS = 6 * 60 * 60 * 1000;
+  for (const [key, session] of sessions.entries()) {
+    if (session.lastUpdated && (now - session.lastUpdated > SIX_HOURS)) {
+      sessions.delete(key);
+    }
+  }
+}, 60 * 60 * 1000);
 
 app.post('/twilio-webhook', async (req, res) => {
   const from = req.body.From;
@@ -40,7 +52,6 @@ app.post('/twilio-webhook', async (req, res) => {
   const latitude = req.body.Latitude;
   const longitude = req.body.Longitude;
   
-  // Twilio Audio Parameters
   const mediaUrl = req.body.MediaUrl0;
   const mediaType = req.body.MediaContentType0;
   const isAudio = mediaUrl && mediaType && mediaType.startsWith('audio/');
@@ -49,14 +60,29 @@ app.post('/twilio-webhook', async (req, res) => {
 
   let session = sessions.get(from);
 
+  // GLOBAL COMMAND: RESET / START
+  if (body.toLowerCase() === 'reset' || body.toLowerCase() === 'start') {
+    if (session) {
+      session.status = 'RESET';
+      syncToGoogleSheet(session);
+      sessions.delete(from);
+    }
+    return sendResponse(res, `🔄 *AMBULINK DISPATCH RESET*\n\nSend a GPS location pin (📎 Attachment ➔ Location) to start a new emergency request.`);
+  }
+
   // 1. NEW GPS LOCATION PIN
   if (latitude && longitude) {
-    // If we were waiting for a remote location pin, update the patient location
+    const mapsLink = `https://www.google.com/maps?q=${latitude},${longitude}`;
+
+    // Updating remote patient location pin
     if (session && session.step === 'AWAITING_REMOTE_LOCATION') {
       session.lat = latitude;
       session.lon = longitude;
-      session.notes += ` | Patient GPS Updated: (${latitude}, ${longitude})`;
+      session.mapsLink = mapsLink;
+      session.notes += ` | Patient GPS Pin Updated: ${mapsLink}`;
       session.step = 'AWAITING_CONDITION';
+      session.lastUpdated = Date.now();
+      
       sessions.set(from, session);
       syncToGoogleSheet(session);
 
@@ -71,14 +97,17 @@ app.post('/twilio-webhook', async (req, res) => {
       );
     }
 
-    // Otherwise, start a fresh ticket
+    // Start fresh ticket
     session = {
       from,
       step: 'AWAITING_PATIENT_TYPE',
       lat: latitude,
       lon: longitude,
+      mapsLink: mapsLink,
       ticketId: 'AMB-' + Math.floor(1000 + Math.random() * 9000),
       status: 'AWAITING_INFO',
+      timestamp: new Date().toLocaleString('en-UG', { timeZone: 'Africa/Kampala' }),
+      lastUpdated: Date.now(),
       audioUrl: '',
       notes: ''
     };
@@ -98,7 +127,9 @@ app.post('/twilio-webhook', async (req, res) => {
     return sendResponse(res, `🚨 *AMBULINK EMERGENCY DISPATCH*\n\nPlease tap 📎 *Attachment* ➔ *Location* to send your GPS coordinates.`);
   }
 
-  // Define Medical Condition Mapping
+  // Update activity timestamp
+  session.lastUpdated = Date.now();
+
   const conditions = {
     '1': 'Accident / Severe Bleeding',
     '2': 'Breathing Difficulty / Chest Pain',
@@ -139,7 +170,7 @@ app.post('/twilio-webhook', async (req, res) => {
     }
   }
 
-  // 3. STEP 1b: LOCATION CHECK (If requesting for someone else)
+  // 3. STEP 1b: LOCATION CHECK
   if (session.step === 'AWAITING_SAME_LOCATION_CHECK') {
     if (body === '1' || body.toLowerCase().includes('yes')) {
       session.step = 'AWAITING_CONDITION';
@@ -161,13 +192,13 @@ app.post('/twilio-webhook', async (req, res) => {
 
       return sendResponse(res, 
         `📍 *PATIENT LOCATION NEEDED*\n\n` +
-        `Please **type the patient's full address, village, or town landmarks** (e.g., *"Lugazi town, behind Shell petrol station"*),\n\n` +
+        `Please **type the patient's full address or landmark** (e.g., *"Lugazi town, behind Shell petrol station"*),\n\n` +
         `OR drop a pin for the **patient's location** using 📎 *Attachment* ➔ *Location*.`
       );
     }
   }
 
-  // 4. STEP 1c: CAPTURE REMOTE PATIENT ADDRESS / LOCATION
+  // 4. STEP 1c: CAPTURE REMOTE ADDRESS
   if (session.step === 'AWAITING_REMOTE_LOCATION') {
     if (body) {
       session.notes += ` | Patient Address: ${body}`;
@@ -187,7 +218,7 @@ app.post('/twilio-webhook', async (req, res) => {
     }
   }
 
-  // 5. STEP 2: CONDITION & INITIAL DISPATCH
+  // 5. STEP 2: CONDITION & DISPATCH
   if (session.step === 'AWAITING_CONDITION') {
     if (conditions[body] || isAudio) {
       if (isAudio) {
@@ -267,7 +298,7 @@ app.post('/twilio-webhook', async (req, res) => {
     }
   }
 
-  return sendResponse(res, `Please reply with a valid option (1-5), send a Voice Note, or send a new GPS location.`);
+  return sendResponse(res, `⚠️ Option not recognized. Reply with **1 to 5**, send a **Voice Note**, or type **RESET** to start over.`);
 });
 
 function sendResponse(res, textMessage) {
