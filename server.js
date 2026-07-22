@@ -1,312 +1,194 @@
 const express = require('express');
-const app = express();
+const { GoogleGenAI } = require('@google/genai');
 
-app.use(express.urlencoded({ extended: false }));
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Initialize Gemini Client (uses GEMINI_API_KEY environment variable if present)
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+
+// Middleware
 app.use(express.json());
 
-const GOOGLE_SHEET_WEBHOOK_URL = 'https://script.google.com/macros/s/YOUR_APPS_SCRIPT_ID_HERE/exec';
+// System prompt enforcing strict first-aid guardrails
+const FIRST_AID_SYSTEM_INSTRUCTION = `
+You are the Ambulink Emergency First Aid Assistant.
+Your ONLY function is to provide immediate, life-saving, evidence-based first aid guidance while emergency medical personnel are en route.
 
-// Simulated OpenAI Whisper Transcription Helper
-async function transcribeAudio(audioUrl) {
-  try {
-    console.log(`🎙️ Processing voice note from: ${audioUrl}`);
-    return "[Voice Note Received - Play Audio in Dispatch Sheet]"; 
-  } catch (err) {
-    console.error("Audio Transcription Error:", err);
-    return "[Voice note attached]";
-  }
+STRICT GUARDRAILS:
+1. ONLY answer questions directly related to immediate first aid (e.g., severe bleeding, CPR, burns, choking, fractures, snakebites, unconsciousness).
+2. REFUSE any non-first-aid medical requests, medication prescriptions, or general medical diagnoses.
+3. Provide concise, bulleted, step-by-step instructions (maximum 4 steps).
+4. ALWAYS start your response with a clear disclaimer: "🚨 Emergency dispatch notified. Follow these immediate steps while help is on the way:"
+5. If the situation indicates severe emergency (no breathing, severe hemorrhage, cardiac arrest), emphasize calling emergency services immediately.
+`;
+
+// Helper: Haversine distance formula
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * (Math.PI / 180)) *
+      Math.cos(lat2 * (Math.PI / 180)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
 }
 
-// Sync updates to Google Sheets
-async function syncToGoogleSheet(ticketData) {
-  if (!GOOGLE_SHEET_WEBHOOK_URL || GOOGLE_SHEET_WEBHOOK_URL.includes('YOUR_APPS_SCRIPT_ID_HERE')) return;
-  try {
-    await fetch(GOOGLE_SHEET_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(ticketData),
-      redirect: 'follow'
-    });
-  } catch (err) {
-    console.error('❌ Sync Error:', err.message);
+// Initial partner hospitals
+let partnerHospitals = [
+  {
+    hospital_id: "hosp_kawolo_ug_01",
+    name: "Kawolo General Hospital",
+    facility_type: "Public General Hospital",
+    category: "Trauma & Emergency Center",
+    location: {
+      district: "Buikwe",
+      town: "Lugazi",
+      address: "Kampala-Jinja Highway",
+      coordinates: { latitude: 0.368050, longitude: 32.945553 }
+    },
+    emergency_services: { trauma_unit: true, icu_capable: true, operating_theaters: true, ambulance_station: true },
+    dispatch_status: "AVAILABLE"
+  },
+  {
+    hospital_id: "hosp_jinja_ug_02",
+    name: "Jinja Regional Referral Hospital",
+    facility_type: "Regional Referral Hospital",
+    category: "Major Referral & Trauma Center",
+    location: {
+      district: "Jinja",
+      town: "Jinja City",
+      address: "Nalufenya Road",
+      coordinates: { latitude: 0.428300, longitude: 33.203600 }
+    },
+    emergency_services: { trauma_unit: true, icu_capable: true, operating_theaters: true, ambulance_station: true },
+    dispatch_status: "AVAILABLE"
   }
-}
+];
 
-// In-Memory Session Storage
-const sessions = new Map();
+// --- ROUTES ---
 
-// Automatic cleanup: Delete inactive sessions older than 6 hours
-setInterval(() => {
-  const now = Date.now();
-  const SIX_HOURS = 6 * 60 * 60 * 1000;
-  for (const [key, session] of sessions.entries()) {
-    if (session.lastUpdated && (now - session.lastUpdated > SIX_HOURS)) {
-      sessions.delete(key);
-    }
-  }
-}, 60 * 60 * 1000);
-
-app.post('/twilio-webhook', async (req, res) => {
-  const from = req.body.From;
-  const body = req.body.Body ? req.body.Body.trim() : '';
-  const latitude = req.body.Latitude;
-  const longitude = req.body.Longitude;
-  
-  const mediaUrl = req.body.MediaUrl0;
-  const mediaType = req.body.MediaContentType0;
-  const isAudio = mediaUrl && mediaType && mediaType.startsWith('audio/');
-
-  if (!from) return sendResponse(res, `Couldn't identify sender.`);
-
-  let session = sessions.get(from);
-
-  // GLOBAL COMMAND: RESET / START
-  if (body.toLowerCase() === 'reset' || body.toLowerCase() === 'start') {
-    if (session) {
-      session.status = 'RESET';
-      syncToGoogleSheet(session);
-      sessions.delete(from);
-    }
-    return sendResponse(res, `🔄 *AMBULINK DISPATCH RESET*\n\nSend a GPS location pin (📎 Attachment ➔ Location) to start a new emergency request.`);
-  }
-
-  // 1. NEW GPS LOCATION PIN
-  if (latitude && longitude) {
-    const mapsLink = `https://www.google.com/maps?q=${latitude},${longitude}`;
-
-    // Updating remote patient location pin
-    if (session && session.step === 'AWAITING_REMOTE_LOCATION') {
-      session.lat = latitude;
-      session.lon = longitude;
-      session.mapsLink = mapsLink;
-      session.notes += ` | Patient GPS Pin Updated: ${mapsLink}`;
-      session.step = 'AWAITING_CONDITION';
-      session.lastUpdated = Date.now();
-      
-      sessions.set(from, session);
-      syncToGoogleSheet(session);
-
-      return sendResponse(res,
-        `📍 *PATIENT LOCATION SAVED!*\n\n` +
-        `What is the primary medical emergency?\n\n` +
-        `1️⃣ 🩸 Accident / Severe Bleeding\n` +
-        `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
-        `3️⃣ 🧠 Unconscious / Unresponsive\n` +
-        `4️⃣ 🤰 Pregnancy / Labor\n` +
-        `5️⃣ ⚠️ Other Urgent Emergency`
-      );
-    }
-
-    // Start fresh ticket
-    session = {
-      from,
-      step: 'AWAITING_PATIENT_TYPE',
-      lat: latitude,
-      lon: longitude,
-      mapsLink: mapsLink,
-      ticketId: 'AMB-' + Math.floor(1000 + Math.random() * 9000),
-      status: 'AWAITING_INFO',
-      timestamp: new Date().toLocaleString('en-UG', { timeZone: 'Africa/Kampala' }),
-      lastUpdated: Date.now(),
-      audioUrl: '',
-      notes: ''
-    };
-
-    sessions.set(from, session);
-    syncToGoogleSheet(session);
-
-    return sendResponse(res, 
-      `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
-      `Ticket *#${session.ticketId}* logged.\n` +
-      `Who needs emergency medical help?\n\n` +
-      `1️⃣ Myself\n2️⃣ Someone else`
-    );
-  }
-
-  if (!session) {
-    return sendResponse(res, `🚨 *AMBULINK EMERGENCY DISPATCH*\n\nPlease tap 📎 *Attachment* ➔ *Location* to send your GPS coordinates.`);
-  }
-
-  // Update activity timestamp
-  session.lastUpdated = Date.now();
-
-  const conditions = {
-    '1': 'Accident / Severe Bleeding',
-    '2': 'Breathing Difficulty / Chest Pain',
-    '3': 'Unconscious / Unresponsive',
-    '4': 'Pregnancy / Labor',
-    '5': 'Other Urgent Emergency'
-  };
-
-  // 2. STEP 1: PATIENT TYPE
-  if (session.step === 'AWAITING_PATIENT_TYPE') {
-    if (body === '1' || body.toLowerCase().includes('myself')) {
-      session.patient = 'Self';
-      session.step = 'AWAITING_CONDITION';
-      sessions.set(from, session);
-
-      return sendResponse(res, 
-        `Got it (Patient: *Self*).\n\n` +
-        `What is the primary medical emergency?\n\n` +
-        `1️⃣ 🩸 Accident / Severe Bleeding\n` +
-        `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
-        `3️⃣ 🧠 Unconscious / Unresponsive\n` +
-        `4️⃣ 🤰 Pregnancy / Labor\n` +
-        `5️⃣ ⚠️ Other Urgent Emergency\n\n` +
-        `*(Or send a quick Voice Note)*`
-      );
-    } 
-    
-    if (body === '2' || body.toLowerCase().includes('someone')) {
-      session.patient = 'Bystander/Other';
-      session.step = 'AWAITING_SAME_LOCATION_CHECK';
-      sessions.set(from, session);
-
-      return sendResponse(res, 
-        `Are you currently at the **same location** as the patient?\n\n` +
-        `1️⃣ Yes, I am with the patient\n` +
-        `2️⃣ No, patient is somewhere else`
-      );
-    }
-  }
-
-  // 3. STEP 1b: LOCATION CHECK
-  if (session.step === 'AWAITING_SAME_LOCATION_CHECK') {
-    if (body === '1' || body.toLowerCase().includes('yes')) {
-      session.step = 'AWAITING_CONDITION';
-      sessions.set(from, session);
-
-      return sendResponse(res, 
-        `Got it. What is the primary medical emergency?\n\n` +
-        `1️⃣ 🩸 Accident / Severe Bleeding\n` +
-        `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
-        `3️⃣ 🧠 Unconscious / Unresponsive\n` +
-        `4️⃣ 🤰 Pregnancy / Labor\n` +
-        `5️⃣ ⚠️ Other Urgent Emergency`
-      );
-    }
-
-    if (body === '2' || body.toLowerCase().includes('no')) {
-      session.step = 'AWAITING_REMOTE_LOCATION';
-      sessions.set(from, session);
-
-      return sendResponse(res, 
-        `📍 *PATIENT LOCATION NEEDED*\n\n` +
-        `Please **type the patient's full address or landmark** (e.g., *"Lugazi town, behind Shell petrol station"*),\n\n` +
-        `OR drop a pin for the **patient's location** using 📎 *Attachment* ➔ *Location*.`
-      );
-    }
-  }
-
-  // 4. STEP 1c: CAPTURE REMOTE ADDRESS
-  if (session.step === 'AWAITING_REMOTE_LOCATION') {
-    if (body) {
-      session.notes += ` | Patient Address: ${body}`;
-      session.step = 'AWAITING_CONDITION';
-      sessions.set(from, session);
-      syncToGoogleSheet(session);
-
-      return sendResponse(res, 
-        `Address saved: *"${body}"*\n\n` +
-        `What is the primary medical emergency?\n\n` +
-        `1️⃣ 🩸 Accident / Severe Bleeding\n` +
-        `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
-        `3️⃣ 🧠 Unconscious / Unresponsive\n` +
-        `4️⃣ 🤰 Pregnancy / Labor\n` +
-        `5️⃣ ⚠️ Other Urgent Emergency`
-      );
-    }
-  }
-
-  // 5. STEP 2: CONDITION & DISPATCH
-  if (session.step === 'AWAITING_CONDITION') {
-    if (conditions[body] || isAudio) {
-      if (isAudio) {
-        session.audioUrl = mediaUrl;
-        session.condition = "Voice Note Provided";
-        session.notes += ` | Voice Note: ${await transcribeAudio(mediaUrl)}`;
-      } else {
-        session.condition = conditions[body];
-      }
-
-      session.step = 'DISPATCHED';
-      session.status = 'DISPATCHED';
-      sessions.set(from, session);
-
-      syncToGoogleSheet(session);
-
-      return sendResponse(res, 
-        `✅ *AMBULANCE DISPATCHED!*\n\n` +
-        `Ticket: *#${session.ticketId}*\n` +
-        `Condition: *${session.condition}*\n\n` +
-        `📍 Paramedics en route to the location provided.\n\n` +
-        `💡 Reply *1-5* to update condition, send a *Voice Note*, or reply *CANCEL*.`
-      );
-    }
-  }
-
-  // 6. TICKET ALREADY DISPATCHED ➔ Handle Updates
-  if (session.step === 'DISPATCHED') {
-    if (conditions[body]) {
-      const oldCondition = session.condition;
-      session.condition = conditions[body];
-      session.notes += ` | Corrected from [${oldCondition}] to [${session.condition}]`;
-      
-      sessions.set(from, session);
-      syncToGoogleSheet(session);
-
-      return sendResponse(res, 
-        `🔄 *TICKET UPDATED!*\n\n` +
-        `Ticket: *#${session.ticketId}*\n` +
-        `Updated Condition: *${session.condition}*\n\n` +
-        `Dispatch control room and paramedics have been notified.`
-      );
-    }
-
-    if (isAudio) {
-      session.audioUrl = mediaUrl;
-      const transcript = await transcribeAudio(mediaUrl);
-      session.notes += ` | Voice Note: ${transcript}`;
-      
-      sessions.set(from, session);
-      syncToGoogleSheet(session);
-
-      return sendResponse(res, 
-        `🎙️ *VOICE NOTE RECEIVED*\n\n` +
-        `Audio recording attached to Ticket *#${session.ticketId}* and forwarded directly to the responding unit.`
-      );
-    }
-
-    if (body.toLowerCase() === 'cancel') {
-      session.status = 'CANCELLED';
-      syncToGoogleSheet(session);
-      sessions.delete(from);
-
-      return sendResponse(res, `🛑 Ticket *#${session.ticketId}* has been CANCELLED. Send a new location pin if you still need help.`);
-    }
-
-    if (body) {
-      session.notes += ` | Note: ${body}`;
-      sessions.set(from, session);
-      syncToGoogleSheet(session);
-
-      return sendResponse(res, 
-        `📝 *NOTE ADDED TO TICKET #${session.ticketId}*\n\n` +
-        `"${body}"\n\n` +
-        `Paramedics en route. Reply *1-5* to update condition, or reply *CANCEL*.`
-      );
-    }
-  }
-
-  return sendResponse(res, `⚠️ Option not recognized. Reply with **1 to 5**, send a **Voice Note**, or type **RESET** to start over.`);
+// GET: All hospitals
+app.get('/api/v1/hospitals', (req, res) => {
+  res.status(200).json({ success: true, count: partnerHospitals.length, data: partnerHospitals });
 });
 
-function sendResponse(res, textMessage) {
-  res.type('text/xml').send(`
-    <Response>
-      <Message>${textMessage}</Message>
-    </Response>
-  `);
-}
+// GET: Single hospital
+app.get('/api/v1/hospitals/:id', (req, res) => {
+  const hospital = partnerHospitals.find(h => h.hospital_id === req.params.id);
+  if (!hospital) return res.status(404).json({ success: false, message: "Hospital not found" });
+  res.status(200).json({ success: true, data: hospital });
+});
 
-module.exports = app;
+// POST: Register hospital
+app.post('/api/v1/hospitals', (req, res) => {
+  const newHospital = req.body;
+  if (!newHospital.hospital_id || !newHospital.name) {
+    return res.status(400).json({ success: false, message: "hospital_id and name are required." });
+  }
+  partnerHospitals.push(newHospital);
+  res.status(201).json({ success: true, message: "Hospital registered", data: newHospital });
+});
+
+// POST: Ambulance Dispatch
+app.post('/api/v1/dispatch', (req, res) => {
+  const { incident_id, location, emergency_type } = req.body;
+  if (!location || location.latitude === undefined || location.longitude === undefined) {
+    return res.status(400).json({ success: false, message: "Location coordinates required." });
+  }
+
+  const available = partnerHospitals.filter(h => h.dispatch_status === "AVAILABLE");
+  if (available.length === 0) {
+    return res.status(503).json({ success: false, message: "No available partner hospitals." });
+  }
+
+  let nearest = null;
+  let shortestDist = Infinity;
+
+  available.forEach(hospital => {
+    const dist = calculateDistance(
+      location.latitude,
+      location.longitude,
+      hospital.location.coordinates.latitude,
+      hospital.location.coordinates.longitude
+    );
+    if (dist < shortestDist) {
+      shortestDist = dist;
+      nearest = hospital;
+    }
+  });
+
+  res.status(200).json({
+    success: true,
+    message: "Emergency dispatch assigned",
+    data: {
+      dispatch_id: `disp_${Date.now()}`,
+      incident_id: incident_id || `inc_${Math.floor(Math.random() * 10000)}`,
+      emergency_type: emergency_type || "General Emergency",
+      status: "DISPATCHED",
+      timestamp: new Date().toISOString(),
+      assigned_hospital: {
+        hospital_id: nearest.hospital_id,
+        name: nearest.name,
+        town: nearest.location.town
+      },
+      distance_km: parseFloat(shortestDist.toFixed(2)),
+      estimated_eta_minutes: Math.ceil(shortestDist * 2)
+    }
+  });
+});
+
+// POST: AI First-Aid Guidance Endpoint
+app.post('/api/v1/first-aid', async (req, res) => {
+  const { query, incident_id } = req.body;
+
+  if (!query) {
+    return res.status(400).json({
+      success: false,
+      message: "Please provide a query describing the emergency or injury."
+    });
+  }
+
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({
+      success: false,
+      message: "GEMINI_API_KEY environment variable is missing on the server."
+    });
+  }
+
+  try {
+    const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${query}"`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt
+    });
+
+    res.status(200).json({
+      success: true,
+      incident_id: incident_id || null,
+      first_aid_guidance: response.text,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("AI First-Aid Endpoint Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to generate first-aid response. Please follow standard emergency protocol."
+    });
+  }
+});
+
+// Root check
+app.get('/', (req, res) => {
+  res.send('Ambulink Webhook API with First-Aid AI is running...');
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
