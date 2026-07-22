@@ -188,7 +188,10 @@ app.get('/', (req, res) => {
   res.send('Ambulink Webhook API with First-Aid AI is running...');
 });
 
-// Start server
+// Start server locally
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// Export app for serverless platforms like Vercel
+module.exports = app;
