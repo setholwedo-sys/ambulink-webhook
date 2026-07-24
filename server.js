@@ -165,7 +165,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   // Dynamically uses GEMINI_MODEL env var or defaults to gemini-2.0-flash
-  const targetModel = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+  const targetModel = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
