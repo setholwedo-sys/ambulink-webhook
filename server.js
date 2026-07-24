@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// In-Memory Session Storage (Tracks user flow per WhatsApp phone number)
+const userSessions = {};
+
 // STRICT ULTRA-SHORT EMERGENCY FIRST-AID PROMPT
 const FIRST_AID_SYSTEM_INSTRUCTION = `
 You are Ambulink Emergency AI.
@@ -102,57 +105,6 @@ app.post('/api/v1/hospitals', (req, res) => {
   res.status(201).json({ success: true, message: "Hospital registered", data: newHospital });
 });
 
-app.post('/api/v1/dispatch', (req, res) => {
-  const { incident_id, location, emergency_type } = req.body;
-  if (!location || typeof location.latitude !== 'number' || typeof location.longitude !== 'number') {
-    return res.status(400).json({ success: false, message: "Valid location coordinates required." });
-  }
-
-  const available = partnerHospitals.filter(h => 
-    h.dispatch_status === "AVAILABLE" && 
-    h.location?.coordinates?.latitude !== undefined
-  );
-
-  if (available.length === 0) {
-    return res.status(503).json({ success: false, message: "No available partner hospitals." });
-  }
-
-  let nearest = null;
-  let shortestDist = Infinity;
-
-  available.forEach(hospital => {
-    const dist = calculateDistance(
-      location.latitude,
-      location.longitude,
-      hospital.location.coordinates.latitude,
-      hospital.location.coordinates.longitude
-    );
-    if (dist < shortestDist) {
-      shortestDist = dist;
-      nearest = hospital;
-    }
-  });
-
-  res.status(200).json({
-    success: true,
-    message: "Emergency dispatch assigned",
-    data: {
-      dispatch_id: `disp_${Date.now()}`,
-      incident_id: incident_id || `inc_${Math.floor(Math.random() * 10000)}`,
-      emergency_type: emergency_type || "General Emergency",
-      status: "DISPATCHED",
-      timestamp: new Date().toISOString(),
-      assigned_hospital: {
-        hospital_id: nearest.hospital_id,
-        name: nearest.name,
-        town: nearest.location.town
-      },
-      distance_km: parseFloat(shortestDist.toFixed(2)),
-      estimated_eta_minutes: Math.ceil(shortestDist * 2)
-    }
-  });
-});
-
 app.post('/api/v1/first-aid', async (req, res) => {
   const { query, incident_id } = req.body;
 
@@ -161,6 +113,8 @@ app.post('/api/v1/first-aid', async (req, res) => {
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
+  const modelName = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
   if (!apiKey) {
     return res.status(500).json({ success: false, message: "GEMINI_API_KEY environment variable missing on server." });
   }
@@ -168,7 +122,7 @@ app.post('/api/v1/first-aid', async (req, res) => {
   try {
     const ai = new GoogleGenAI({ apiKey });
     const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${query}"`;
-    const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
+    const response = await ai.models.generateContent({ model: modelName, contents: prompt });
 
     res.status(200).json({
       success: true,
@@ -182,65 +136,20 @@ app.post('/api/v1/first-aid', async (req, res) => {
   }
 });
 
-// --- HARDENED WHATSAPP DISPATCH & TRIAGE WEBHOOK ---
+// --- MULTI-STEP WHATSAPP DISPATCH & TRIAGE WEBHOOK ---
 
 app.post('/webhook', async (req, res) => {
+  const userPhone = req.body.From || 'unknown';
   const rawBody = req.body.Body || '';
   const incomingMsg = rawBody.trim().toLowerCase();
   const userLat = req.body.Latitude;
   const userLon = req.body.Longitude;
 
-  // Keyword Categories
-  const resetKeywords = ['0', 'menu', 'reset', 'cancel', 'back', 'start', 'help', 'hi', 'hello', 'hey', 'emergency', 'ambulink', 'sos'];
-  const locationHelpKeywords = ['location', 'pin', 'gps', 'map', 'send location', 'where'];
+  const resetKeywords = ['0', 'menu', 'reset', 'cancel', 'back', 'start', 'help', 'hi', 'hello', 'hey', 'emergency', 'ambulink'];
 
-  // 1. DISPATCH: User sent a Location Pin via WhatsApp
-  if (userLat && userLon) {
-    const lat = parseFloat(userLat);
-    const lon = parseFloat(userLon);
-
-    const available = partnerHospitals.filter(h => 
-      h.dispatch_status === "AVAILABLE" && 
-      h.location?.coordinates?.latitude !== undefined
-    );
-
-    if (available.length === 0) {
-      return safeXmlResponse(res, "🚨 *NO HOSPITALS AVAILABLE*\nPlease contact national emergency services immediately.");
-    }
-
-    let nearest = null;
-    let shortestDist = Infinity;
-
-    available.forEach(hospital => {
-      const dist = calculateDistance(lat, lon, hospital.location.coordinates.latitude, hospital.location.coordinates.longitude);
-      if (dist < shortestDist) {
-        shortestDist = dist;
-        nearest = hospital;
-      }
-    });
-
-    const eta = Math.ceil(shortestDist * 2);
-    const replyText = `🚨 *AMBULANCE DISPATCHED!*\n\n` +
-                      `🏥 **${nearest.name}**\n` +
-                      `📍 **${shortestDist.toFixed(1)} km** away | ⏱️ **ETA: ~${eta} mins**\n\n` +
-                      `Stay calm. Reply with injury for First Aid advice.\n` +
-                      `📌 *Reply 0 for Main Menu.*`;
-
-    return safeXmlResponse(res, replyText);
-  }
-
-  // 2. LOCATION INSTRUCTIONS: User typed keywords asking how to send location
-  if (locationHelpKeywords.some(keyword => incomingMsg.includes(keyword))) {
-    const replyText = `📍 *HOW TO SHARE LOCATION FOR AMBULANCE:*\n\n` +
-                      `1. Tap the **📎 Attachment** icon (or **+** on iPhone) in WhatsApp.\n` +
-                      `2. Select **Location**.\n` +
-                      `3. Tap **Send Your Current Location**.\n\n` +
-                      `📌 *Reply 0 for Main Menu.*`;
-    return safeXmlResponse(res, replyText);
-  }
-
-  // 3. MENU / RESET: Greeting or Navigational Reset Commands
-  if (incomingMsg === '' || resetKeywords.includes(incomingMsg)) {
+  // Global Navigation: Reset Session
+  if (resetKeywords.includes(incomingMsg)) {
+    delete userSessions[userPhone];
     const replyText = `🚨 *AMBULINK EMERGENCY*\n\n` +
                       `📍 **Need Ambulance?**\n` +
                       `Send your **Location Pin** (tap 📎 icon -> Location).\n\n` +
@@ -249,11 +158,102 @@ app.post('/webhook', async (req, res) => {
     return safeXmlResponse(res, replyText);
   }
 
-  // 4. FIRST AID AI: Dynamic Key Check & Call
+  // STEP 1: User sends Location Pin -> Log Ticket & Ask Patient Type
+  if (userLat && userLon) {
+    const ticketId = `AMB-${Math.floor(1000 + Math.random() * 9000)}`;
+    const lat = parseFloat(userLat).toFixed(8);
+    const lon = parseFloat(userLon).toFixed(8);
+
+    userSessions[userPhone] = {
+      state: 'AWAITING_PATIENT_TYPE',
+      ticketId: ticketId,
+      lat: lat,
+      lon: lon
+    };
+
+    const replyText = `🚨 *AMBULINK EMERGENCY DISPATCH*\n\n` +
+                      `Ticket #${ticketId} logged.\n` +
+                      `Coordinates: ${lat}, ${lon}\n\n` +
+                      `Who needs emergency medical help?\n\n` +
+                      `1️⃣ Myself\n` +
+                      `2️⃣ Someone else`;
+
+    return safeXmlResponse(res, replyText);
+  }
+
+  // Check active state for user
+  const session = userSessions[userPhone];
+
+  // STEP 2: Handle Patient Selection (1 or 2)
+  if (session && session.state === 'AWAITING_PATIENT_TYPE') {
+    let patientLabel = '';
+    if (incomingMsg === '1' || incomingMsg.includes('myself')) {
+      patientLabel = 'Self';
+    } else if (incomingMsg === '2' || incomingMsg.includes('someone')) {
+      patientLabel = 'Bystander/Other';
+    } else {
+      return safeXmlResponse(res, `Please select a valid option:\n\n1️⃣ Myself\n2️⃣ Someone else`);
+    }
+
+    session.patient = patientLabel;
+    session.state = 'AWAITING_EMERGENCY_TYPE';
+
+    const replyText = `Got it (Patient: *${patientLabel}*).\n\n` +
+                      `What is the primary medical emergency?\n\n` +
+                      `1️⃣ 🩸 Accident / Severe Bleeding\n` +
+                      `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
+                      `3️⃣ 🧠 Unconscious / Unresponsive\n` +
+                      `4️⃣ 🤰 Pregnancy / Labor\n` +
+                      `5️⃣ ⚠️ Other Urgent Emergency`;
+
+    return safeXmlResponse(res, replyText);
+  }
+
+  // STEP 3: Handle Medical Emergency Selection (1 to 5)
+  if (session && session.state === 'AWAITING_EMERGENCY_TYPE') {
+    let immediateAction = "";
+
+    switch (incomingMsg) {
+      case '1':
+        immediateAction = "• Apply direct, hard pressure to the wound with a clean cloth.\n• Keep patient still and elevate injured area above heart if possible.";
+        break;
+      case '2':
+        immediateAction = "• Sit patient upright in a comfortable position.\n• Loosen tight clothing around neck and chest; ensure fresh airflow.";
+        break;
+      case '3':
+        immediateAction = "• Roll patient onto their side in recovery position.\n• Keep airway clear and monitor breathing continuously.";
+        break;
+      case '4':
+        immediateAction = "• Keep patient lying on her left side in a quiet, warm area.\n• Prepare clean towels and remain calm.";
+        break;
+      case '5':
+      default:
+        immediateAction = "• Keep patient calm, comfortable, and warm until paramedics arrive.";
+        break;
+    }
+
+    session.state = 'DISPATCHED';
+
+    const replyText = `⚠️ *IMMEDIATE ACTION:*\n` +
+                      `${immediateAction}\n\n` +
+                      `📞 *Need urgent human escalation?* Call our dispatch control line immediately if conditions worsen.`;
+
+    return safeXmlResponse(res, replyText);
+  }
+
+  // STEP 4: Active Dispatch Status Message
+  if (session && session.state === 'DISPATCHED') {
+    const replyText = `🚑 Ambulance unit for Ticket *#${session.ticketId}* is currently moving to your location.\n\n` +
+                      `Keep this line open. To request a new ambulance, please send a new GPS location pin.`;
+
+    return safeXmlResponse(res, replyText);
+  }
+
+  // STEP 5: AI First Aid Fallback for free text input
   const apiKey = process.env.GEMINI_API_KEY;
+  const modelName = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
   if (!apiKey) {
-    console.error("Missing GEMINI_API_KEY in Vercel environment");
     const replyText = "🚨 *CONFIG ERROR:* GEMINI_API_KEY is missing in Vercel settings.\n\n📍 Send **Location Pin** (📎) for an ambulance.";
     return safeXmlResponse(res, replyText);
   }
@@ -262,7 +262,7 @@ app.post('/webhook', async (req, res) => {
     const ai = new GoogleGenAI({ apiKey });
     const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${rawBody}"`;
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: modelName,
       contents: prompt
     });
 
@@ -277,7 +277,7 @@ app.post('/webhook', async (req, res) => {
 
 // Root check
 app.get('/', (req, res) => {
-  res.send('Ambulink Webhook API with First-Aid AI is running...');
+  res.send('Ambulink Multi-Step Dispatch & First-Aid API is running...');
 });
 
 // Server listener
