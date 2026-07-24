@@ -251,7 +251,6 @@ app.post('/webhook', async (req, res) => {
 
   // STEP 5: AI First Aid Fallback for free text input
   const apiKey = process.env.GEMINI_API_KEY;
-  const modelName = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
   if (!apiKey) {
     const replyText = "🚨 *CONFIG ERROR:* GEMINI_API_KEY is missing in Vercel settings.\n\n📍 Send **Location Pin** (📎) for an ambulance.";
@@ -260,10 +259,9 @@ app.post('/webhook', async (req, res) => {
 
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${rawBody}"`;
     const response = await ai.models.generateContent({
-      model: modelName,
-      contents: prompt
+      model: 'gemini-1.5-flash',
+      contents: `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${rawBody}"`
     });
 
     const replyText = `${response.text}\n\n-------------------\n📍 **Need Ambulance?** Send **Location Pin** (📎).\n📌 *Reply 0 for Main Menu.*`;
@@ -273,8 +271,6 @@ app.post('/webhook', async (req, res) => {
     const replyText = `🚨 *AI Error:* ${error.message || 'Unable to generate response.'}\n\n📍 Send **Location Pin** (📎) for an ambulance.\n📌 *Reply 0 for Main Menu.*`;
     return safeXmlResponse(res, replyText);
   }
-});
-
 // Root check
 app.get('/', (req, res) => {
   res.send('Ambulink Multi-Step Dispatch & First-Aid API is running...');
