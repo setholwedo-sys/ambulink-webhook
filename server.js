@@ -8,10 +8,10 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// In-Memory Session Storage (Tracks user state per phone number)
+// In-Memory Session Storage
 const userSessions = {};
 
-// FIRST-AID SYSTEM INSTRUCTION
+// STRICT FIRST-AID SYSTEM INSTRUCTION
 const FIRST_AID_SYSTEM_INSTRUCTION = `
 You are Ambulink Emergency AI.
 CRITICAL RULE: BREVITY SAVES LIVES. Keep responses ultra-short, action-focused, and UNDER 50 WORDS TOTAL.
@@ -24,10 +24,10 @@ GUARDRAILS:
 5. NO pleasantries, intro filler, or medical chatter.
 `;
 
-// Haversine distance formula (in km)
+// Haversine Distance Formula (in km)
 function calculateDistance(lat1, lon1, lat2, lon2) {
   if ([lat1, lon1, lat2, lon2].some(v => typeof v !== 'number' || isNaN(v))) return Infinity;
-  const R = 6371; // Earth radius in km
+  const R = 6371;
   const dLat = (lat2 - lat1) * (Math.PI / 180);
   const dLon = (lon2 - lon1) * (Math.PI / 180);
   const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
@@ -52,7 +52,7 @@ let partnerHospitals = [
   }
 ];
 
-// Helper to wrap response in TwiML XML format for WhatsApp
+// Helper to return valid TwiML XML to WhatsApp
 function safeXmlResponse(res, messageText) {
   const cleanText = messageText.replace(/]]>/g, ']]&gt;');
   res.type('text/xml');
@@ -62,10 +62,10 @@ function safeXmlResponse(res, messageText) {
 </Response>`);
 }
 
-// REST Endpoints
+// REST API Endpoints
 app.get('/api/v1/hospitals', (req, res) => res.json({ success: true, data: partnerHospitals }));
 
-// Multi-step WhatsApp Dispatch & AI Webhook
+// Multi-step WhatsApp Webhook
 app.post('/webhook', async (req, res) => {
   const userPhone = req.body.From || 'unknown';
   const rawBody = req.body.Body || '';
@@ -75,19 +75,18 @@ app.post('/webhook', async (req, res) => {
 
   const resetKeywords = ['0', 'menu', 'reset', 'cancel', 'start', 'help', 'hi', 'hello', 'emergency', 'ambulink'];
 
-  // Global Navigation: Reset Session
+  // Global Navigation Reset
   if (resetKeywords.includes(incomingMsg)) {
     delete userSessions[userPhone];
-    return safeXmlResponse(res, `🚨 *AMBULINK EMERGENCY*\n\n📍 **Need Ambulance?**\nSend your **Location Pin** (tap 📎 icon -> Location).\n\n🩹 **Need First Aid?**\nReply with injury (e.g., *"bleeding"*).`);
+    return safeXmlResponse(res, `🚨 *AMBULINK EMERGENCY*\n\n📍 **Need Ambulance?**\nSend your **Location Pin** (tap 📎 -> Location).\n\n🩹 **Need First Aid?**\nReply with injury (e.g., *"bleeding"*).`);
   }
 
-  // STEP 1: User sends Location Pin -> Calculate Nearest Hospital, Distance (km) & ETA
+  // STEP 1: Location Pin Received -> Log Ticket & Calculate Distance + ETA
   if (userLat && userLon) {
     const lat = parseFloat(userLat);
     const lon = parseFloat(userLon);
     const ticketId = `AMB-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    // Find nearest available hospital
     const available = partnerHospitals.filter(h => h.dispatch_status === "AVAILABLE" && h.location?.coordinates?.latitude);
     let nearest = available[0] || partnerHospitals[0];
     let shortestDist = Infinity;
@@ -103,7 +102,6 @@ app.post('/webhook', async (req, res) => {
     const distKm = shortestDist !== Infinity ? shortestDist.toFixed(1) : "1.5";
     const etaMins = Math.ceil(parseFloat(distKm) * 2) || 5;
 
-    // Save calculation into user's session state
     userSessions[userPhone] = {
       state: 'AWAITING_PATIENT_TYPE',
       ticketId: ticketId,
@@ -128,25 +126,17 @@ app.post('/webhook', async (req, res) => {
 
   const session = userSessions[userPhone];
 
-  // STEP 2: Handle Patient Selection
+  // STEP 2: Patient Selection
   if (session && session.state === 'AWAITING_PATIENT_TYPE') {
     if (incomingMsg === '1' || incomingMsg === '2' || incomingMsg.includes('myself') || incomingMsg.includes('someone')) {
       session.patient = (incomingMsg === '1' || incomingMsg.includes('myself')) ? 'Self' : 'Bystander/Other';
       session.state = 'AWAITING_EMERGENCY_TYPE';
-      
-      const replyText = `Got it (Patient: *${session.patient}*).\n\n` +
-                        `What is the primary medical emergency?\n\n` +
-                        `1️⃣ 🩸 Accident / Severe Bleeding\n` +
-                        `2️⃣ 🫁 Breathing Difficulty / Chest Pain\n` +
-                        `3️⃣ 🧠 Unconscious / Unresponsive\n` +
-                        `4️⃣ 🤰 Pregnancy / Labor\n` +
-                        `5️⃣ ⚠️ Other Urgent Emergency`;
 
-      return safeXmlResponse(res, replyText);
+      return safeXmlResponse(res, `Got it (Patient: *${session.patient}*).\n\nWhat is the primary medical emergency?\n\n1️⃣ 🩸 Accident / Severe Bleeding\n2️⃣ 🫁 Breathing Difficulty / Chest Pain\n3️⃣ 🧠 Unconscious / Unresponsive\n4️⃣ 🤰 Pregnancy / Labor\n5️⃣ ⚠️ Other Urgent Emergency`);
     }
   }
 
-  // STEP 3: Handle Emergency Category & Dispatch Action
+  // STEP 3: Emergency Category Selection
   if (session && session.state === 'AWAITING_EMERGENCY_TYPE') {
     const actions = {
       '1': "• Apply direct, hard pressure to the wound with a clean cloth.\n• Keep patient still and elevate injury above heart if possible.",
@@ -158,31 +148,29 @@ app.post('/webhook', async (req, res) => {
     session.state = 'DISPATCHED';
     const action = actions[incomingMsg] || "• Keep patient calm, comfortable, and warm until paramedics arrive.";
 
-    const replyText = `⚠️ *IMMEDIATE ACTION:*\n${action}\n\n` +
-                      `🚑 Dispatching from **${session.hospitalName}** (*${session.distanceKm} km away*, ETA **~${session.etaMins} mins**).\n\n` +
-                      `📞 *Need urgent human escalation?* Call our dispatch control line immediately if conditions worsen.`;
-
-    return safeXmlResponse(res, replyText);
+    return safeXmlResponse(res, `⚠️ *IMMEDIATE ACTION:*\n${action}\n\n` +
+                              `🚑 Dispatching from **${session.hospitalName}** (*${session.distanceKm} km away*, ETA **~${session.etaMins} mins**).\n\n` +
+                              `📞 *Need urgent human escalation?* Call our dispatch control line immediately if conditions worsen.`);
   }
 
-  // STEP 4: Active Dispatch Status Message
+  // STEP 4: Active Dispatch Status
   if (session && session.state === 'DISPATCHED') {
-    const replyText = `🚑 Ambulance unit from **${session.hospitalName}** (*${session.distanceKm} km away*) for Ticket *#${session.ticketId}* is currently moving to your location (ETA ~${session.etaMins} mins).\n\n` +
-                      `Keep this line open. To request a new ambulance, please send a new GPS location pin.`;
-
-    return safeXmlResponse(res, replyText);
+    return safeXmlResponse(res, `🚑 Ambulance unit from **${session.hospitalName}** (*${session.distanceKm} km away*) for Ticket *#${session.ticketId}* is currently moving to your location (ETA ~${session.etaMins} mins).\n\nKeep this line open. To request a new ambulance, send a new GPS location pin.`);
   }
 
-  // STEP 5: First-Aid AI Fallback for Free Text
+  // STEP 5: AI First-Aid Fallback
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return safeXmlResponse(res, "🚨 *CONFIG ERROR:* GEMINI_API_KEY missing in Vercel settings.\n\n📍 Send **Location Pin** (📎) for an ambulance.");
   }
 
+  // Dynamically uses GEMINI_MODEL env var or defaults to gemini-2.0-flash
+  const targetModel = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-flash",
+      model: targetModel,
       systemInstruction: FIRST_AID_SYSTEM_INSTRUCTION 
     });
 
@@ -190,7 +178,7 @@ app.post('/webhook', async (req, res) => {
     return safeXmlResponse(res, `${result.response.text()}\n\n-------------------\n📍 **Need Ambulance?** Send **Location Pin** (📎).\n📌 *Reply 0 for Main Menu.*`);
   } catch (error) {
     console.error("WhatsApp AI Error:", error);
-    return safeXmlResponse(res, `🚨 *AI Error:* ${error.message || 'Unable to generate response.'}\n\n📍 Send **Location Pin** (📎) for an ambulance.`);
+    return safeXmlResponse(res, `🚨 *First Aid Assistant Notice:* Guidance service unavailable.\n\n📍 Send **Location Pin** (📎) directly to request an ambulance.\n📌 *Reply 0 for Main Menu.*`);
   }
 });
 
