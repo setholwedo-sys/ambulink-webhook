@@ -11,9 +11,9 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// STRICT ULTRA-SHORT EMERGENCY PROMPT
+// STRICT ULTRA-SHORT EMERGENCY FIRST-AID PROMPT
 const FIRST_AID_SYSTEM_INSTRUCTION = `
-You are Ambulink Emergency AI. 
+You are Ambulink Emergency AI.
 CRITICAL RULE: BREVITY SAVES LIVES. Keep responses ultra-short, action-focused, and UNDER 50 WORDS TOTAL.
 
 GUARDRAILS:
@@ -24,9 +24,12 @@ GUARDRAILS:
 5. NO pleasantries, intro filler, or medical chatter.
 `;
 
-// Helper: Haversine distance formula
+// Safe Haversine distance formula
 function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371;
+  if ([lat1, lon1, lat2, lon2].some(v => typeof v !== 'number' || isNaN(v))) {
+    return Infinity;
+  }
+  const R = 6371; // Earth radius in km
   const dLat = (lat2 - lat1) * (Math.PI / 180);
   const dLon = (lon2 - lon1) * (Math.PI / 180);
   const a =
@@ -39,7 +42,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Partner hospitals
+// Initial partner hospitals
 let partnerHospitals = [
   {
     hospital_id: "hosp_kawolo_ug_01",
@@ -71,7 +74,17 @@ let partnerHospitals = [
   }
 ];
 
-// --- API ROUTES ---
+// Helper to escape XML characters safely for TwiML
+function safeXmlResponse(res, messageText) {
+  const cleanText = messageText.replace(/]]>/g, ']]&gt;');
+  res.type('text/xml');
+  return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message><![CDATA[${cleanText}]]></Message>
+</Response>`);
+}
+
+// --- REST API ENDPOINTS ---
 
 app.get('/api/v1/hospitals', (req, res) => {
   res.status(200).json({ success: true, count: partnerHospitals.length, data: partnerHospitals });
@@ -94,11 +107,15 @@ app.post('/api/v1/hospitals', (req, res) => {
 
 app.post('/api/v1/dispatch', (req, res) => {
   const { incident_id, location, emergency_type } = req.body;
-  if (!location || location.latitude === undefined || location.longitude === undefined) {
-    return res.status(400).json({ success: false, message: "Location required." });
+  if (!location || typeof location.latitude !== 'number' || typeof location.longitude !== 'number') {
+    return res.status(400).json({ success: false, message: "Valid location coordinates required." });
   }
 
-  const available = partnerHospitals.filter(h => h.dispatch_status === "AVAILABLE");
+  const available = partnerHospitals.filter(h => 
+    h.dispatch_status === "AVAILABLE" && 
+    h.location?.coordinates?.latitude !== undefined
+  );
+
   if (available.length === 0) {
     return res.status(503).json({ success: false, message: "No available partner hospitals." });
   }
@@ -165,80 +182,96 @@ app.post('/api/v1/first-aid', async (req, res) => {
   }
 });
 
-// --- ULTRA-SHORT EMERGENCY WHATSAPP WEBHOOK ---
+// --- HARDENED WHATSAPP DISPATCH & TRIAGE WEBHOOK ---
 
 app.post('/webhook', async (req, res) => {
-  const incomingMsg = (req.body.Body || '').trim().toLowerCase();
+  const rawBody = req.body.Body || '';
+  const incomingMsg = rawBody.trim().toLowerCase();
   const userLat = req.body.Latitude;
   const userLon = req.body.Longitude;
-  let replyText = '';
 
-  // 1. DISPATCH: User sent a Location Pin
+  // Keyword Categories
+  const resetKeywords = ['0', 'menu', 'reset', 'cancel', 'back', 'start', 'help', 'hi', 'hello', 'hey', 'emergency', 'ambulink', 'sos'];
+  const locationHelpKeywords = ['location', 'pin', 'gps', 'map', 'send location', 'where'];
+
+  // 1. DISPATCH: User sent a Location Pin via WhatsApp
   if (userLat && userLon) {
     const lat = parseFloat(userLat);
     const lon = parseFloat(userLon);
-    const available = partnerHospitals.filter(h => h.dispatch_status === "AVAILABLE");
+
+    const available = partnerHospitals.filter(h => 
+      h.dispatch_status === "AVAILABLE" && 
+      h.location?.coordinates?.latitude !== undefined
+    );
 
     if (available.length === 0) {
-      replyText = "🚨 *NO HOSPITALS AVAILABLE*\nCall national emergency line immediately.";
-    } else {
-      let nearest = null;
-      let shortestDist = Infinity;
-
-      available.forEach(hospital => {
-        const dist = calculateDistance(lat, lon, hospital.location.coordinates.latitude, hospital.location.coordinates.longitude);
-        if (dist < shortestDist) {
-          shortestDist = dist;
-          nearest = hospital;
-        }
-      });
-
-      const eta = Math.ceil(shortestDist * 2);
-      replyText = `🚨 *AMBULANCE DISPATCHED!*\n\n` +
-                  `🏥 **${nearest.name}**\n` +
-                  `📍 **${shortestDist.toFixed(1)} km** away | ⏱️ **ETA: ~${eta} mins**\n\n` +
-                  `Stay calm. Reply with injury for First Aid instructions.`;
+      return safeXmlResponse(res, "🚨 *NO HOSPITALS AVAILABLE*\nPlease contact national emergency services immediately.");
     }
-  } 
-  // 2. SHORT TRIAGE: Greeting / General text
-  else if (
-    incomingMsg === '' || 
-    ['hi', 'hello', 'hey', 'start', 'help', 'menu', 'emergency', 'ambulink'].includes(incomingMsg)
-  ) {
-    replyText = `🚨 *AMBULINK EMERGENCY*\n\n` +
-                `📍 **Need Ambulance?**\n` +
-                `Send your **Location Pin** (📎 icon).\n\n` +
-                `🩹 **Need First Aid?**\n` +
-                `Reply with injury (e.g., *"bleeding"*, *"burn"*, *"choking"*).`;
-  } 
-  // 3. RAPID FIRST AID: Gemini response
-  else {
-    try {
-      const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${req.body.Body}"`;
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt
-      });
-      
-      replyText = `${response.text}\n\n-------------------\n📍 *Need Ambulance?* Send **Location Pin** (📎).`;
-    } catch (error) {
-      console.error("WhatsApp AI Webhook Error:", error);
-      replyText = "🚨 Emergency registered.\n\n📍 Send your **Location Pin** (📎) for an ambulance.";
-    }
+
+    let nearest = null;
+    let shortestDist = Infinity;
+
+    available.forEach(hospital => {
+      const dist = calculateDistance(lat, lon, hospital.location.coordinates.latitude, hospital.location.coordinates.longitude);
+      if (dist < shortestDist) {
+        shortestDist = dist;
+        nearest = hospital;
+      }
+    });
+
+    const eta = Math.ceil(shortestDist * 2);
+    const replyText = `🚨 *AMBULANCE DISPATCHED!*\n\n` +
+                      `🏥 **${nearest.name}**\n` +
+                      `📍 **${shortestDist.toFixed(1)} km** away | ⏱️ **ETA: ~${eta} mins**\n\n` +
+                      `Stay calm. Reply with injury for First Aid advice.\n` +
+                      `📌 *Reply 0 for Main Menu.*`;
+
+    return safeXmlResponse(res, replyText);
   }
 
-  // Send TwiML XML
-  res.type('text/xml');
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message><![CDATA[${replyText}]]></Message>
-</Response>`);
+  // 2. LOCATION INSTRUCTIONS: User typed keywords asking how to send location
+  if (locationHelpKeywords.some(keyword => incomingMsg.includes(keyword))) {
+    const replyText = `📍 *HOW TO SHARE LOCATION FOR AMBULANCE:*\n\n` +
+                      `1. Tap the **📎 Attachment** icon (or **+** on iPhone) in WhatsApp.\n` +
+                      `2. Select **Location**.\n` +
+                      `3. Tap **Send Your Current Location**.\n\n` +
+                      `📌 *Reply 0 for Main Menu.*`;
+    return safeXmlResponse(res, replyText);
+  }
+
+  // 3. MENU / RESET: Greeting or Navigational Reset Commands
+  if (incomingMsg === '' || resetKeywords.includes(incomingMsg)) {
+    const replyText = `🚨 *AMBULINK EMERGENCY*\n\n` +
+                      `📍 **Need Ambulance?**\n` +
+                      `Send your **Location Pin** (tap 📎 icon -> Location).\n\n` +
+                      `🩹 **Need First Aid?**\n` +
+                      `Reply with injury (e.g., *"bleeding"*, *"burn"*, *"choking"*).`;
+    return safeXmlResponse(res, replyText);
+  }
+
+  // 4. FIRST AID AI: Process Query via Gemini AI
+  try {
+    const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${rawBody}"`;
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt
+    });
+
+    const replyText = `${response.text}\n\n-------------------\n📍 **Need Ambulance?** Send **Location Pin** (📎).\n📌 *Reply 0 for Main Menu.*`;
+    return safeXmlResponse(res, replyText);
+  } catch (error) {
+    console.error("WhatsApp AI Webhook Error:", error);
+    const replyText = "🚨 Emergency registered.\n\n📍 Send **Location Pin** (📎) for an ambulance.\n📌 *Reply 0 for Main Menu.*";
+    return safeXmlResponse(res, replyText);
+  }
 });
 
+// Root check
 app.get('/', (req, res) => {
   res.send('Ambulink Webhook API with First-Aid AI is running...');
 });
 
+// Server listener
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
