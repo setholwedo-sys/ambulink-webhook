@@ -4,9 +4,6 @@ const { GoogleGenAI } = require('@google/genai');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Gemini Client
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
-
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -163,11 +160,13 @@ app.post('/api/v1/first-aid', async (req, res) => {
     return res.status(400).json({ success: false, message: "Query required." });
   }
 
-  if (!process.env.GEMINI_API_KEY) {
-    return res.status(500).json({ success: false, message: "GEMINI_API_KEY missing." });
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ success: false, message: "GEMINI_API_KEY environment variable missing on server." });
   }
 
   try {
+    const ai = new GoogleGenAI({ apiKey });
     const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${query}"`;
     const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
 
@@ -178,6 +177,7 @@ app.post('/api/v1/first-aid', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   } catch (error) {
+    console.error("REST AI Error:", error);
     res.status(500).json({ success: false, message: "Failed to generate first-aid response." });
   }
 });
@@ -249,8 +249,17 @@ app.post('/webhook', async (req, res) => {
     return safeXmlResponse(res, replyText);
   }
 
-  // 4. FIRST AID AI: Process Query via Gemini AI
+  // 4. FIRST AID AI: Dynamic Key Check & Call
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    console.error("Missing GEMINI_API_KEY in Vercel environment");
+    const replyText = "🚨 *CONFIG ERROR:* GEMINI_API_KEY is missing in Vercel settings.\n\n📍 Send **Location Pin** (📎) for an ambulance.";
+    return safeXmlResponse(res, replyText);
+  }
+
   try {
+    const ai = new GoogleGenAI({ apiKey });
     const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${rawBody}"`;
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
@@ -261,7 +270,7 @@ app.post('/webhook', async (req, res) => {
     return safeXmlResponse(res, replyText);
   } catch (error) {
     console.error("WhatsApp AI Webhook Error:", error);
-    const replyText = "🚨 Emergency registered.\n\n📍 Send **Location Pin** (📎) for an ambulance.\n📌 *Reply 0 for Main Menu.*";
+    const replyText = `🚨 *AI Error:* ${error.message || 'Unable to generate response.'}\n\n📍 Send **Location Pin** (📎) for an ambulance.\n📌 *Reply 0 for Main Menu.*`;
     return safeXmlResponse(res, replyText);
   }
 });
