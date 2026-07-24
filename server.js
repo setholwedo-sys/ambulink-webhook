@@ -4,23 +4,24 @@ const { GoogleGenAI } = require('@google/genai');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Gemini Client (uses GEMINI_API_KEY environment variable if present)
+// Initialize Gemini Client
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 // Middleware
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// System prompt enforcing strict first-aid guardrails
+// STRICT ULTRA-SHORT EMERGENCY PROMPT
 const FIRST_AID_SYSTEM_INSTRUCTION = `
-You are the Ambulink Emergency First Aid Assistant.
-Your ONLY function is to provide immediate, life-saving, evidence-based first aid guidance while emergency medical personnel are en route.
+You are Ambulink Emergency AI. 
+CRITICAL RULE: BREVITY SAVES LIVES. Keep responses ultra-short, action-focused, and UNDER 50 WORDS TOTAL.
 
-STRICT GUARDRAILS:
-1. ONLY answer questions directly related to immediate first aid (e.g., severe bleeding, CPR, burns, choking, fractures, snakebites, unconsciousness).
-2. REFUSE any non-first-aid medical requests, medication prescriptions, or general medical diagnoses.
-3. Provide concise, bulleted, step-by-step instructions (maximum 4 steps).
-4. ALWAYS start your response with a clear disclaimer: "🚨 Emergency dispatch notified. Follow these immediate steps while help is on the way:"
-5. If the situation indicates severe emergency (no breathing, severe hemorrhage, cardiac arrest), emphasize calling emergency services immediately.
+GUARDRAILS:
+1. First-aid ONLY (bleeding, CPR, burns, choking, fractures, bites, unconsciousness).
+2. Start with: "🚨 Follow these immediate steps:"
+3. Maximum 3 short bullet points.
+4. Use BOLD action verbs (e.g., **PRESS hard**, **TILT head**).
+5. NO pleasantries, intro filler, or medical chatter.
 `;
 
 // Helper: Haversine distance formula
@@ -38,7 +39,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Initial partner hospitals
+// Partner hospitals
 let partnerHospitals = [
   {
     hospital_id: "hosp_kawolo_ug_01",
@@ -70,35 +71,31 @@ let partnerHospitals = [
   }
 ];
 
-// --- ROUTES ---
+// --- API ROUTES ---
 
-// GET: All hospitals
 app.get('/api/v1/hospitals', (req, res) => {
   res.status(200).json({ success: true, count: partnerHospitals.length, data: partnerHospitals });
 });
 
-// GET: Single hospital
 app.get('/api/v1/hospitals/:id', (req, res) => {
   const hospital = partnerHospitals.find(h => h.hospital_id === req.params.id);
   if (!hospital) return res.status(404).json({ success: false, message: "Hospital not found" });
   res.status(200).json({ success: true, data: hospital });
 });
 
-// POST: Register hospital
 app.post('/api/v1/hospitals', (req, res) => {
   const newHospital = req.body;
   if (!newHospital.hospital_id || !newHospital.name) {
-    return res.status(400).json({ success: false, message: "hospital_id and name are required." });
+    return res.status(400).json({ success: false, message: "hospital_id and name required." });
   }
   partnerHospitals.push(newHospital);
   res.status(201).json({ success: true, message: "Hospital registered", data: newHospital });
 });
 
-// POST: Ambulance Dispatch
 app.post('/api/v1/dispatch', (req, res) => {
   const { incident_id, location, emergency_type } = req.body;
   if (!location || location.latitude === undefined || location.longitude === undefined) {
-    return res.status(400).json({ success: false, message: "Location coordinates required." });
+    return res.status(400).json({ success: false, message: "Location required." });
   }
 
   const available = partnerHospitals.filter(h => h.dispatch_status === "AVAILABLE");
@@ -142,31 +139,20 @@ app.post('/api/v1/dispatch', (req, res) => {
   });
 });
 
-// POST: AI First-Aid Guidance Endpoint
 app.post('/api/v1/first-aid', async (req, res) => {
   const { query, incident_id } = req.body;
 
   if (!query) {
-    return res.status(400).json({
-      success: false,
-      message: "Please provide a query describing the emergency or injury."
-    });
+    return res.status(400).json({ success: false, message: "Query required." });
   }
 
   if (!process.env.GEMINI_API_KEY) {
-    return res.status(500).json({
-      success: false,
-      message: "GEMINI_API_KEY environment variable is missing on the server."
-    });
+    return res.status(500).json({ success: false, message: "GEMINI_API_KEY missing." });
   }
 
   try {
     const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${query}"`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt
-    });
+    const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
 
     res.status(200).json({
       success: true,
@@ -175,23 +161,86 @@ app.post('/api/v1/first-aid', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    console.error("AI First-Aid Endpoint Error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to generate first-aid response. Please follow standard emergency protocol."
-    });
+    res.status(500).json({ success: false, message: "Failed to generate first-aid response." });
   }
 });
 
-// Root check
+// --- ULTRA-SHORT EMERGENCY WHATSAPP WEBHOOK ---
+
+app.post('/webhook', async (req, res) => {
+  const incomingMsg = (req.body.Body || '').trim().toLowerCase();
+  const userLat = req.body.Latitude;
+  const userLon = req.body.Longitude;
+  let replyText = '';
+
+  // 1. DISPATCH: User sent a Location Pin
+  if (userLat && userLon) {
+    const lat = parseFloat(userLat);
+    const lon = parseFloat(userLon);
+    const available = partnerHospitals.filter(h => h.dispatch_status === "AVAILABLE");
+
+    if (available.length === 0) {
+      replyText = "🚨 *NO HOSPITALS AVAILABLE*\nCall national emergency line immediately.";
+    } else {
+      let nearest = null;
+      let shortestDist = Infinity;
+
+      available.forEach(hospital => {
+        const dist = calculateDistance(lat, lon, hospital.location.coordinates.latitude, hospital.location.coordinates.longitude);
+        if (dist < shortestDist) {
+          shortestDist = dist;
+          nearest = hospital;
+        }
+      });
+
+      const eta = Math.ceil(shortestDist * 2);
+      replyText = `🚨 *AMBULANCE DISPATCHED!*\n\n` +
+                  `🏥 **${nearest.name}**\n` +
+                  `📍 **${shortestDist.toFixed(1)} km** away | ⏱️ **ETA: ~${eta} mins**\n\n` +
+                  `Stay calm. Reply with injury for First Aid instructions.`;
+    }
+  } 
+  // 2. SHORT TRIAGE: Greeting / General text
+  else if (
+    incomingMsg === '' || 
+    ['hi', 'hello', 'hey', 'start', 'help', 'menu', 'emergency', 'ambulink'].includes(incomingMsg)
+  ) {
+    replyText = `🚨 *AMBULINK EMERGENCY*\n\n` +
+                `📍 **Need Ambulance?**\n` +
+                `Send your **Location Pin** (📎 icon).\n\n` +
+                `🩹 **Need First Aid?**\n` +
+                `Reply with injury (e.g., *"bleeding"*, *"burn"*, *"choking"*).`;
+  } 
+  // 3. RAPID FIRST AID: Gemini response
+  else {
+    try {
+      const prompt = `${FIRST_AID_SYSTEM_INSTRUCTION}\n\nUSER EMERGENCY QUERY: "${req.body.Body}"`;
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt
+      });
+      
+      replyText = `${response.text}\n\n-------------------\n📍 *Need Ambulance?* Send **Location Pin** (📎).`;
+    } catch (error) {
+      console.error("WhatsApp AI Webhook Error:", error);
+      replyText = "🚨 Emergency registered.\n\n📍 Send your **Location Pin** (📎) for an ambulance.";
+    }
+  }
+
+  // Send TwiML XML
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message><![CDATA[${replyText}]]></Message>
+</Response>`);
+});
+
 app.get('/', (req, res) => {
   res.send('Ambulink Webhook API with First-Aid AI is running...');
 });
 
-// Start server locally
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-// Export app for serverless platforms like Vercel
 module.exports = app;
